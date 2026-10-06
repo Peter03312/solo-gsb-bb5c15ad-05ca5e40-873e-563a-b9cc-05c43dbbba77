@@ -371,6 +371,9 @@ def _build_backfill(conn, published_row):
     分给该逾期评审人——barred_pairs 使该 (评审人, 论文) 在求解中以
     review_overdue 排除 (仅对该论文排除, 不影响该评审人的其余论文)。
     未设置截止或截止未到时 barred_pairs 为空, 完全沿用既有补位行为。
+    逾期口径排除已撤回稿与删除冻结稿: 旧截止只约束当前仍有效的槽位,
+    删除凭据冻结的旧槽位既不列入逾期明细, 也不得阻止重录稿再次分给原
+    评审人 (重录稿对全部合格评审人开放, 仅服从求解硬约束)。
 
     论文删除 (含同编号重新录入但尚未重新发布): 删除凭据已冻结当前发布序号,
     该序号槽位的旧确认不作为固定位置 (重录稿仍参与求解, 仅释放旧槽位,
@@ -408,7 +411,12 @@ def _build_backfill(conn, published_row):
     overdue_pairs = {
         (rid, pid)
         for (pid, rid) in _overdue_pairs(conn, serial, plan, now)
-        if pid not in withdrawn_paper_ids
+        # 撤回稿不补位, 逾期槽位同样不计撤回稿 (该稿评审已停止, 不产生逾期重分);
+        # 删除凭据冻结当前序号槽位的论文 (含同编号重录但尚未重新发布): 旧截止属于
+        # 被冻结的旧序号, 旧槽位一律不计逾期——既不作为逾期槽位释放/列示, 也不得因
+        # 旧截止把重录稿再次分给原评审人 (旧确认本就不沿用, 重录稿对全部合格评审人
+        # 开放, 仅求解硬约束; 评审人在补位发布推进序号后按新序号重新确认并提交)。
+        if pid not in withdrawn_paper_ids and pid not in deleted_frozen_paper_ids
     }
     # 求解器 barred_pairs 约定为 (reviewer_id, paper_id);
     # overdue_slots 明细仍按 (paper_id, reviewer_id) 输出, 与状态视图一致
@@ -1529,6 +1537,11 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
     返回当前发布序号/修订号、截止设置 (未设置为 null)、是否已到截止、
     服务端当前 UTC 时刻、按状态汇总的计数与逐槽位明细; 已撤回稿带 withdrawn
     标记, 其槽位不计逾期也不列入汇总计数。
+
+    已被会务方删除的论文 (删除凭据冻结当前发布序号; 含同编号重录但尚未重新
+    发布) 其历史槽位仍随当前发布版保留供会务方追溯, 但这些冻结槽位不属于
+    当前截止状态汇总: 不判逾期、不计入 summary, 逐槽位明细带 deleted 标记并
+    显示删除前的历史状态 (旧确认/评语仅供追溯)。
     """
     with db.read_txn() as conn:
         published = _load_published(conn)
@@ -1545,10 +1558,29 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
                 "SELECT paper_id FROM papers WHERE withdrawn = 1"
             ).fetchall()
         }
+        # 删除凭据冻结当前序号槽位的论文: 旧截止不再约束这些槽位, 不计入当前
+        # 截止状态汇总与逾期 (重录稿须重新发布推进序号后按新序号重新确认/提交)。
+        deleted_paper_ids = {
+            r["paper_id"] for r in conn.execute(
+                "SELECT DISTINCT paper_id FROM paper_deletions"
+                " WHERE published_serial = ?",
+                (serial,),
+            ).fetchall()
+        }
+        # 冻结槽位的逾期口径与补位一致: 撤回稿与删除冻结稿均不判逾期
+        hidden_from_deadline = withdrawn_paper_ids | deleted_paper_ids
         expired = (
             deadline is not None and now >= datetime.fromisoformat(deadline["deadline_at"])
         )
-        overdue = _overdue_pairs(conn, serial, plan, now) if expired else set()
+        overdue = (
+            {
+                pair
+                for pair in _overdue_pairs(conn, serial, plan, now)
+                if pair[0] not in hidden_from_deadline
+            }
+            if expired
+            else set()
+        )
         slots = []
         summary = {
             "unconfirmed": 0,
@@ -1558,11 +1590,13 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
             "overdue": 0,
         }
         withdrawn_slots = 0
+        deleted_slots = 0
         for pid in sorted(plan):
             for rid in plan[pid]:
                 d = decisions.get((pid, rid))
                 r = reviews.get((pid, rid))
                 is_withdrawn = pid in withdrawn_paper_ids
+                is_deleted = pid in deleted_paper_ids
                 if d is not None and d["state"] == "recused":
                     state = "recused"
                 elif r is not None:
@@ -1575,6 +1609,10 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
                     state = "unconfirmed"
                 if is_withdrawn:
                     withdrawn_slots += 1
+                elif is_deleted:
+                    # 删除冻结槽位不判逾期: 保留删除前的历史状态供会务方追溯,
+                    # 但不列入当前截止汇总 (旧截止不得约束重录稿)
+                    deleted_slots += 1
                 else:
                     summary[state] += 1
                 slots.append(
@@ -1587,6 +1625,7 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
                         "recused": d is not None and d["state"] == "recused",
                         "receipt": r["receipt"] if r is not None else None,
                         "withdrawn": is_withdrawn,
+                        "deleted": is_deleted,
                     }
                 )
         return {
@@ -1597,6 +1636,7 @@ def get_review_deadline(_: bool = Depends(require_organizer)):
             "server_time": now.isoformat(),
             "summary": summary,
             "withdrawn_slots": withdrawn_slots,
+            "deleted_slots": deleted_slots,
             "slots": slots,
         }
 
@@ -3418,10 +3458,14 @@ def backfill_dry_run(_: bool = Depends(require_organizer)):
     (fixed_problems 中标注 fixed_review_overdue), 且本次补位不得把该稿重新
     分给该逾期评审人 (该对在 papers 的 excluded 中标注 review_overdue);
     响应附 review_deadline、deadline_expired 与 overdue_slots 供会务方核对。
+    但该截止只约束当前仍有效的槽位: 已撤回稿与已删除冻结稿 (删除凭据冻结
+    当前序号, 含同编号重录但未重新发布) 的旧槽位不计入 overdue_slots, 也不得
+    因旧截止把重录稿排除给原评审人。
 
     论文删除 (含同编号重录但尚未重新发布): 删除凭据冻结的当前序号槽位不作为
     固定位置, 其旧确认在补位发布时释放——响应 deleted_frozen_slots 列出这些
-    已确认槽位 (重录稿仍参与本次求解, 可被重新分给任何评审人, 但须重新确认)。
+    已确认槽位 (重录稿仍参与本次求解, 可被重新分给任何评审人, 但须重新确认);
+    旧确认与旧评语仅供追溯, 补位发布推进序号后评审人一律按新序号重新确认并提交。
     """
     with db.write_txn() as conn:
         published = _load_published(conn)

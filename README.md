@@ -152,7 +152,16 @@ UTC 评审截止时刻（`POST /review-deadline`，请求体
 - 截止判定与**评语提交、确认、补位发布共用同一把写事务锁**，截止到点与提交/发布
   并发时由事务串行化，绝不出现"既在截止后交评语、又被判逾期释放"的竞态；
 - **旧版截止不约束新发布版**：普通发布/补位发布推进 `serial` 后，旧序号的截止行
-  保留但不再生效，新版本初始无截止、可独立设置自己的截止。
+  保留但不再生效，新版本初始无截止、可独立设置自己的截止；
+- **旧截止与删除冻结序号的交叉处理**：逾期口径只覆盖**当前仍有效**的槽位——
+  论文删除凭据冻结当前发布序号的历史槽位（含同编号重录但尚未重新发布）与已撤回
+  槽位**不计入 `summary` 与 `overdue_slots`、不产生 `fixed_review_overdue` 释放**，
+  逐槽位明细带 `deleted`/`withdrawn` 标记并保留删除/撤回前历史状态供追溯（另以
+  `deleted_slots` 计数）；**旧截止不得阻止重录稿再次分给原评审人**（重录稿对全部
+  合格评审人开放，仅服从既有求解硬约束）；冻结槽位的旧确认/旧评语仅供追溯，补位
+  发布推进序号后计入 `released_deleted_confirmations`，评审人在新序号一律重新
+  确认并重新提交；**其他论文的真实逾期照常**释放并禁止该稿原槽位重分，两类口径
+  在预演与发布中完全一致。
 
 **面向作者的匿名反馈快照**：会务方按论文发布（`POST /papers/{paper_id}/feedback-snapshot`，
 请求体携带**当前发布序号 `serial`**）：
@@ -453,10 +462,10 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | GET | `/assignment/locks` | 会务方查看当前锁定表（`locks`、资料修订号、锁定论文/槽位计数） |
 | POST | `/assignment/dry-run` | 预演：返回方案、未分配论文与限制原因、各等级已分配/未分配数量（`level_summary`）、资料修订号；有锁定时保留锁定槽位，锁定失效以 `lock_*` 诊断并标为不可完整分配；无法完整覆盖时按 总数→高/中等级数→字典序 选取部分方案；不影响已发布版 |
 | POST | `/assignment/publish` | 发布：携带 `{"base_revision": N}`，修订号过期 `409`，无可行方案 `422` |
-| POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` 及各等级已分配/未分配数量（`level_summary`）；无法完整覆盖时同样按 总数→高/中等级数→字典序 选取部分方案；**删除冻结的旧序号槽位在 `deleted_frozen_slots` 列明（补位发布时不沿用确认）** |
-| POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422`；响应附 `carried_confirmations`/`carried_reviews` 与 **`released_deleted_confirmations`/`deleted_frozen_slots`（删除重录后旧确认不沿用，须按新序号重新确认）** |
+| POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` 及各等级已分配/未分配数量（`level_summary`）；无法完整覆盖时同样按 总数→高/中等级数→字典序 选取部分方案；**删除冻结的旧序号槽位在 `deleted_frozen_slots` 列明（补位发布时不沿用确认）**；**统一截止逾期只计当前仍有效槽位：删除冻结槽位（含同编号重录未重新发布）与撤回槽位不进 `overdue_slots`，旧截止不得阻止重录稿再次分给原评审人；其他论文真实逾期照常释放并以 `review_overdue` 禁止该稿原槽位重分** |
+| POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422`（均不改当前发布版）；响应附 `carried_confirmations`/`carried_reviews` 与 **`released_deleted_confirmations`/`deleted_frozen_slots`（删除重录后旧确认不沿用，须按新序号重新确认）**、`released_overdue_confirmations`/`overdue_slots`（真实逾期释放，两类冻结/逾期口径与预演一致，发布方案与预演相同） |
 | POST | `/review-deadline` | 为当前发布版设置一次统一 UTC 评审截止：`{"base_revision":N,"base_serial":M,"deadline_at":"2026-11-01T12:00:00Z"}`；时刻须显式携带时区（归一化 UTC）且晚于当前时刻；尚未发布 `404`，修订号/序号不符 `409`，非法/过去时刻 `422`；同版同时刻重试幂等（`changed=false`），同版异时刻 `409`；设置不推进修订号/序号、不改方案与历史 |
-| GET | `/review-deadline` | 会务方查看当前发布版截止设置、是否已到截止、服务端 UTC 时刻，以及各槽位状态（`unconfirmed`/`confirmed_unsubmitted`/`submitted`/`recused`/`overdue`）与汇总计数；已撤回槽位单独标记、不计入汇总 |
+| GET | `/review-deadline` | 会务方查看当前发布版截止设置、是否已到截止、服务端 UTC 时刻，以及各槽位状态（`unconfirmed`/`confirmed_unsubmitted`/`submitted`/`recused`/`overdue`）与汇总计数；已撤回槽位单独标记（`withdrawn`）、不计入汇总；**删除凭据冻结当前序号的历史槽位（含同编号重录但未重新发布）带 `deleted=true` 标记并显示删除前历史状态，但不判逾期、不计入 `summary`，另以 `deleted_slots` 计数（旧确认/评语仅供会务方追溯）** |
 | GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态；撤回稿仍在当前发布版视图中但带 `withdrawn=true` 与 `withdrawal_reason`（另返回 `withdrawn_papers` 清单），评审人侧则立即不可见 |
 | GET | `/papers/{paper_id}/reviews` | 会务方按论文查看当前两名评审人的评语提交进度、评语全文，及被移出槽位的追溯评语（`archived_reviews`）与全部更正记录（`corrections`）；撤回稿返回 `withdrawn=true` 与撤回记录（撤回后又重新发布过普通方案时 `slots` 为空、原评语全部在 `archived_reviews`） |
 | POST | `/papers/{paper_id}/review-corrections` | 会务方发起评语更正请求：`{"paper_id","serial","reviewer_id","reason"}`；仅当前仍分配、已确认且已交评语的槽位；旧序号 `409`、已移出槽位 `404`、未确认/未交评语 `409`、空原因 `422`、**论文已撤回 `409`**、**论文已被会务方删除（历史槽位冻结在该序号）`404`**；同槽位同原因重复发起幂等（`changed=false`），异原因 `409`；发起即令该稿既有反馈访问码失效 |
@@ -502,6 +511,11 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 （`./examples/guarantee_levels.sh`，建议对新库运行）；
 本轮统一 UTC 评审截止流程见 [`examples/deadlines.sh`](examples/deadlines.sh)
 （`./examples/deadlines.sh`，建议对新库运行）；
+本轮**删除凭据冻结序号与统一评审截止的交叉处理**（截止已过后删除并同编号重录：
+冻结槽位不计入截止汇总/补位逾期明细，旧截止不阻止重录稿再分原评审人；其他论文
+真实逾期照常释放并禁止该稿原槽位重分；补位发布推进序号后重新确认并提交）流程见
+[`examples/deadline_deleted_frozen.sh`](examples/deadline_deleted_frozen.sh)
+（`./examples/deadline_deleted_frozen.sh`，建议对新库运行）；
 本轮会务方实例迁移（导出 → 空实例恢复）流程见 [`examples/migration.sh`](examples/migration.sh)
 （`./examples/migration.sh`，需要一个已有数据的源实例与一个空库目标实例）；
 本轮论文删除反馈生命周期（删除同事务失效旧码/过期异议、历史与凭据可追溯、同编号重录旧码不复活、
@@ -1031,6 +1045,97 @@ curl $BASE/review-deadline -H "$ORG"
 可运行脚本见 [`examples/deadlines.sh`](examples/deadlines.sh)
 （`./examples/deadlines.sh`，建议对新库运行；脚本会把截止设为约 2 分钟后并等待到点演示）。
 
+### 本轮用法：删除凭据冻结序号与统一评审截止的交叉处理
+
+修复的缺陷：论文删除后当前发布版保留旧槽位（删除凭据冻结该发布序号）；若该版的
+统一评审截止已过，删除后以同编号重录并尝试补位时，**旧槽位仍被判逾期**——求解器
+把原评审人以 `review_overdue` 排除，可能导致两名合格评审人也无法补齐（补位发布
+`422`）。修复后旧截止只约束**当前仍有效的槽位**：
+
+- 删除凭据冻结当前序号的槽位（含同编号重录但尚未重新发布）**不计入当前截止状态
+  汇总**：`GET /review-deadline` 的 `summary` 不含这些槽位，逐槽位明细带
+  `deleted=true` 并显示删除前的历史状态（如 `confirmed_unsubmitted`），但**绝不标
+  `overdue`**；响应另以 `deleted_slots` 给出冻结槽位数（与 `withdrawn_slots` 并列）；
+- 补位预演的逾期明细 `overdue_slots` 与 `fixed_review_overdue` 释放**不含冻结
+  槽位**；旧截止**不得阻止重录稿再次分给原评审人**（重录稿对全部合格评审人开放，
+  仅服从机构/专长/回避/容量等既有求解硬约束）；冻结的旧确认槽位仍在
+  `deleted_frozen_slots` 列明；
+- 旧确认与旧评语**仅供会务方追溯**：补位发布推进序号后，冻结槽位一律按删除释放
+  （计入 `released_deleted_confirmations`），评审人在新序号为 `pending`，必须
+  **重新确认并重新提交**（新序号无旧截止约束）；
+- **其他论文的真实逾期照常**：从固定位置释放（`fixed_review_overdue`），并禁止该稿
+  原槽位评审人在本次补位中重新获稿（`review_overdue`），发布计入
+  `released_overdue_confirmations`；
+- **预演与发布结果一致**：发布方案与预演相同；版本不符（期间有资料变更或任何发布）
+  `409`、无完整补位方案 `422`，均拒绝且不改当前发布版。
+
+```bash
+# 93. 前置: P1/P2 各 2 名评审人, 发布 (serial=S) 后四人均"确认但未交评语",
+#     会务方设置统一截止并等待到点 -> 四个槽位届时全部逾期
+curl -s -X POST $BASE/review-deadline -H "$ORG" -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV, \"base_serial\": $SER,
+       \"deadline_at\": \"2026-11-01T12:00:00Z\"}"
+
+# 94. 截止已过后删除 P1 并以同编号重录 (当前发布版/序号不变, 修订号推进;
+#     删除凭据冻结 serial=S 的两个旧槽位)
+curl -s -X DELETE $BASE/papers/P1 -H "$ORG"
+# -> {"ok":true,...,"deletion":{"published_serial":S,"published_plan":["R1","R2"],...}}
+curl -s -X POST $BASE/papers -H "$ORG" -H 'Content-Type: application/json' \
+  -d '{"paper_id":"P1","manuscript":"同编号重录稿","topics":["AI"],"institutions":["Univ-Y"]}'
+
+# 95. 截止状态汇总: P1 冻结槽位不判逾期 (显示删除前 confirmed_unsubmitted 历史状态、
+#     deleted=true, 不计入 summary), 仅 P2 两个槽位真实逾期; 另返回 deleted_slots=2
+curl $BASE/review-deadline -H "$ORG"
+# -> {"serial":S,"deadline_expired":true,
+#     "summary":{"unconfirmed":0,"confirmed_unsubmitted":0,"submitted":0,
+#                "recused":0,"overdue":2},
+#     "withdrawn_slots":0,"deleted_slots":2,
+#     "slots":[{"paper_id":"P1","reviewer_id":"R1","state":"confirmed_unsubmitted",
+#               "deleted":true,...},
+#              {"paper_id":"P2","reviewer_id":"R3","state":"overdue","deleted":false},
+#              ...]}
+
+# 96. 补位预演: P1 重录稿可再分原评审人 (无 review_overdue 排除), 两冻结旧确认列入
+#     deleted_frozen_slots; P2 真实逾期释放 (fixed_review_overdue) 且原评审人对该稿
+#     被 review_overdue 排除; overdue_slots 只含 P2
+curl -s -X POST $BASE/assignment/backfill/dry-run -H "$ORG"
+# -> {"feasible":true,
+#     "overdue_slots":[{"paper_id":"P2","reviewer_id":"R3"},
+#                      {"paper_id":"P2","reviewer_id":"R4"}],
+#     "deleted_frozen_slots":[{"paper_id":"P1","reviewer_id":"R1"},
+#                             {"paper_id":"P1","reviewer_id":"R2"}],
+#     "fixed_problems":{"P2":[{"reviewer_id":"R3","reason":"fixed_review_overdue"},
+#                             {"reviewer_id":"R4","reason":"fixed_review_overdue"}]},
+#     "papers":{"P2":{"excluded":[{"reviewer_id":"R3","reason":"review_overdue"},
+#                                 {"reviewer_id":"R4","reason":"review_overdue"},...]}...},
+#     "plan":{"P1":[...],"P2":[...]}}
+
+# 97. 补位发布: 双版本复核; 方案与预演一致, 两类释放分别计数, 发布序号推进
+curl -s -X POST $BASE/assignment/backfill/publish -H "$ORG" -H 'Content-Type: application/json' \
+  -d "{\"base_revision\": $REV2, \"base_serial\": $SER}"
+# -> {"ok":true,"serial":S+1,
+#     "carried_confirmations":0,
+#     "released_overdue_confirmations":2,
+#     "released_deleted_confirmations":2,
+#     "overdue_slots":[{"paper_id":"P2",...},{...}],
+#     "deleted_frozen_slots":[{"paper_id":"P1",...},{...}],
+#     "plan":{...}            # 与步骤 96 预演完全相同
+# }
+
+# 98. 新序号无旧截止: 全部槽位 pending, 评审人重新确认并提交 (旧确认/评语仅供追溯);
+#     未确认直接交评语 -> 409; 重新确认后提交 -> 200 新收据
+curl $BASE/review-deadline -H "$ORG"
+# -> {"review_deadline":null,"deadline_expired":false,
+#     "summary":{"unconfirmed":4,...},"deleted_slots":0}
+
+# 99. 版本不符拒绝: 预演后再发生资料变更 (或任何发布), 旧预演发布 -> 409, 发布版不变
+#     无完整补位方案 -> 422, 当前发布版同样不变
+```
+
+可运行脚本见 [`examples/deadline_deleted_frozen.sh`](examples/deadline_deleted_frozen.sh)
+（`./examples/deadline_deleted_frozen.sh [BASE_URL]`，建议对新库运行；脚本会把截止
+设为约 2 分钟后并等待到点，覆盖冻结/真实逾期并存、预演=发布、409 拒绝等路径）。
+
 ### 本轮用法：删除已发布反馈的论文（反馈生命周期 + 同编号重录 + 迁移）
 
 ```bash
@@ -1327,6 +1432,7 @@ tests/test_objections.py         # 本轮作者反馈异议：有效码提交、
 tests/test_withdrawals.py        # 本轮论文撤回：修订号核对优先级/幂等原记录/异原因冲突/404/422、同编号不可重录、评审人侧即时停稿、快照码失效、异议同事务过期且凭据可查、锁定清除不阻塞他稿、普通分配/补位跳过、评语/快照/决定/更正追溯
 tests/test_guarantee_levels.py   # 本轮评审保障等级：设置/查询/幂等/版本不符/未知或已撤回/非法等级、部分方案按 总数→高/中等级数→字典序 选取、level_summary、完整可行时等级不影响优化、失效锁定不被等级释放、补位交互、删除/撤回后等级清除
 tests/test_deadlines.py          # 本轮统一 UTC 评审截止：设置双版本核对/时区归一化/未来时刻/幂等/异值拒绝、槽位五态汇总、截止后禁止确认交评语且已交评语与收据有效、补位释放逾期确认且不重分给逾期评审人、其余确认槽位固定、提交与补位发布并发无竞态、旧版截止不约束新版
+tests/test_deadline_deleted_frozen.py # 本轮删除凭据冻结序号 × 统一截止交叉处理：冻结槽位不进截止汇总（deleted 标记/deleted_slots）、补位 overdue_slots/fixed_review_overdue 不含冻结槽位、旧截止不阻止重录稿再分原评审人（修复后可补齐）、冻结旧确认补位发布全部释放须新序号重新确认提交、其他论文真实逾期照常释放且禁止原槽位重分、预演=发布、版本不符 409/无完整方案 422 不改发布版、旧截止随序号推进失效
 tests/test_migration.py          # 本轮会务方实例迁移：导出覆盖全部业务记录且不含会务方密钥、格式版本与校验和、导出与并发写入隔离、空实例全量回环（修订号/发布序号/凭据/访问码/历史记录按原规则工作）、非空目标与重复恢复 409、格式/校验和/记录引用校验失败 422 且不留部分数据；**访问码效力跨记录核验：同序号连续更正/再次发布/跨序号历史快照/待更正/撤回等合法状态可迁移，改回失效标记（含伪造时间戳/旧收据冒充现行）等复活攻击一律 422，恢复后仅当前有效码可读可提异议**
 tests/test_paper_deletions.py    # 本轮论文删除反馈生命周期：删除同事务失效旧快照访问码/过期待处理异议（持码读取与提交同形 404）、查询凭据继续可查、历史快照与异议/删除凭据可追溯、推进修订号但发布版/序号不变、同编号重录旧码不复活（重新发布生成新码）、多次删除重录追加凭据；迁移 v2 删除凭据回环、改回失效标记/pending 矛盾快照 422 且不留部分数据、v1 旧格式沿用原有恢复判断不推断删除历史
 tests/test_reviewer_deleted_paper.py # 本轮删除状态对评审人操作的校验：删除后历史槽位仍在当前发布版但确认/回避/正式评语/评语更正一律 404（不写决定/硬回避/评语/更正、不推进修订号）、取稿/评语/待更正视图移除、会务方不得再发起更正、同编号重录未重新发布继续拒绝、重新发布（普通/补位）后按新序号重新确认并提交（补位不沿用旧确认/旧评语，deleted_frozen_slots/released_deleted_confirmations 核对）、多轮删除重录与历史保留
@@ -1342,6 +1448,7 @@ examples/objections.sh    # 本轮端到端示例（作者凭快照码提异议/
 examples/withdrawals.sh   # 本轮端到端示例（确认/评语/快照/异议 -> 会务方撤回同事务生效 -> 幂等/冲突/版本不符 -> 评审人停稿、快照码失效、异议过期 -> 追溯 -> 后续分配跳过、他稿规则不变）
 examples/guarantee_levels.sh # 本轮端到端示例（设置/查询等级 -> 幂等/非法等级/版本不符 -> 容量不足时高等级优先与 level_summary -> 发布仍拒绝 -> 完整可行时等级不影响优化 -> 删除后等级清除）
 examples/deadlines.sh     # 本轮端到端示例（双版本设置 UTC 截止 -> 同值幂等/异值拒绝 -> 槽位状态 -> 到点逾期禁止确认交评语且已交收据有效 -> 补位释放逾期确认且不重分 -> 旧版截止不约束新版）
+examples/deadline_deleted_frozen.sh # 本轮端到端示例（截止后删除同编号重录：截止汇总冻结槽位不判逾期、补位预演重录稿可再分原评审人、其他论文真实逾期释放并禁止原槽位重分 -> 补位发布两类释放分别计数且预演=发布 -> 新序号重新确认提交、版本不符 409 不改发布版）
 examples/migration.sh     # 本轮端到端示例（源实例导出一致快照 -> 本地复算校验和 -> 空目标实例恢复 -> 修订号/发布序号/凭据/访问码按原规则工作；重复恢复 409；**复活攻击演示：把已失效快照标记改回有效并重算校验和 -> 422 矛盾快照、不留部分数据，合法快照恢复后仅当前有效码可读/可提异议**）
 examples/paper_deletions.sh # 本轮端到端示例（快照/异议 -> 删除同事务失效旧码、过期异议、凭据可查、删除凭据追溯 -> 同编号重录重新发布新码旧码仍 404 -> v2 导出含 paper_deletions -> 空实例恢复旧码死/新码活；改回失效标记 422 不留部分数据；v1 旧格式沿用原有恢复判断）
 examples/reviewer_deleted_paper.sh # 本轮端到端示例（删除后评审人确认/回避/正式评语/评语更正统一 404 且不写入/不推进修订号、读视图移除、重录未发布继续拒绝 -> 重新发布按新序号重新确认提交；含补位发布不沿用旧确认/旧评语与多轮删除重录、会务方历史追溯）
